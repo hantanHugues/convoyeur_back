@@ -10,14 +10,40 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const { Server } = require("socket.io");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const Config = require('./models/Config'); // Notre nouveau modèle de configuration
 const { Parser } = require('json2csv');
 const PDFDocument = require('pdfkit');
 // const { SerialPort } = require('serialport');
 // const { ReadlineParser } = require('@serialport/parser-readline');
 
-// --- Configuration ---
-const PORT = process.env.PORT || 5000;
+// --- Configuration Globale de l'Application ---
+// Cet objet contiendra la configuration active, chargée depuis .env puis surchargée par la DB.
+const appConfig = {
+    geminiApiKey: process.env.GEMINI_API_KEY,
+    mongoDbUri: process.env.MONGODB_URI,
+    adminPassword: process.env.ADMIN_PASSWORD,
+    jwtSecret: process.env.JWT_SECRET || 'un-secret-par-defaut-pour-le-dev'
+};
 
+// --- Configuration ---
+// --- Middleware de vérification de Token JWT ---
+const verifyToken = (req, res, next) => {
+    const bearerHeader = req.headers['authorization'];
+    if (typeof bearerHeader !== 'undefined') {
+        const bearerToken = bearerHeader.split(' ')[1];
+        jwt.verify(bearerToken, appConfig.jwtSecret, (err, authData) => {
+            if (err) {
+                return res.sendStatus(403); // Forbidden
+            }
+            req.authData = authData;
+            next();
+        });
+    } else {
+        res.sendStatus(401); // Unauthorized
+    }
+};
 
 // --- Express App Setup ---
 const app = express();
@@ -25,6 +51,80 @@ app.use(cors()); // Enable CORS for all routes
 app.use(express.json()); // Middleware to parse JSON bodies
 
 const server = http.createServer(app);
+const PORT = process.env.PORT || 5000;
+
+// --- API Routes pour l'Administration ---
+
+// Connexion Admin - Logique sécurisée avec bcrypt
+app.post('/api/admin/login', async (req, res) => {
+    const { password } = req.body;
+    if (!password) {
+        return res.status(400).json({ message: 'Le mot de passe est requis.' });
+    }
+
+    try {
+        const config = await Config.getSingleton();
+        if (!config.adminPasswordHash) {
+            return res.status(500).json({ message: 'Le système n\'est pas encore configuré avec un mot de passe administrateur.' });
+        }
+
+        const isMatch = await bcrypt.compare(password, config.adminPasswordHash);
+
+        if (!isMatch) {
+            return res.status(401).json({ message: 'Mot de passe incorrect.' });
+        }
+
+        jwt.sign({ user: 'admin' }, appConfig.jwtSecret, { expiresIn: '8h' }, (err, token) => {
+            if (err) {
+                return res.status(500).json({ message: 'Erreur lors de la création du token.' });
+            }
+            res.json({ token });
+        });
+
+    } catch (error) {
+        console.error('Erreur lors de la connexion admin:', error);
+        res.status(500).json({ message: 'Erreur serveur lors de la connexion.' });
+    }
+});
+
+// Récupérer la configuration actuelle
+app.get('/api/admin/config', verifyToken, async (req, res) => {
+    try {
+        const config = await Config.getSingleton();
+        res.json({
+            geminiApiKey: config.geminiApiKey || ''
+        });
+    } catch (error) {
+        res.status(500).json({ message: 'Erreur serveur', error });
+    }
+});
+
+// Mettre à jour la configuration
+// Mettre à jour la configuration
+app.post('/api/admin/config', verifyToken, async (req, res) => {
+    try {
+        const { geminiApiKey } = req.body;
+        const config = await Config.getSingleton();
+
+        config.geminiApiKey = geminiApiKey;
+        await config.save();
+
+        // Mettre à jour la configuration en mémoire pour Gemini (prise d'effet immédiate)
+        appConfig.geminiApiKey = geminiApiKey;
+        // Recréer l'instance genAI pour utiliser la nouvelle clé
+        if (appConfig.geminiApiKey) {
+            genAI = new GoogleGenerativeAI(appConfig.geminiApiKey);
+            console.log('Instance Gemini re-initialisée avec la nouvelle clé API.');
+        } else {
+            genAI = null; // Désactiver si la clé est vide
+        }
+
+        res.json({ message: 'Clé API Gemini mise à jour avec succès.' });
+    } catch (error) {
+        console.error('Erreur sauvegarde config admin:', error);
+        res.status(500).json({ message: 'Erreur serveur lors de la sauvegarde.' });
+    }
+});
 
 // --- Socket.IO Setup ---
 const io = new Server(server, {
@@ -35,11 +135,7 @@ const io = new Server(server, {
 });
 
 // --- MongoDB Connection ---
-// --- MongoDB Connection ---
-// The connection string is now securely loaded from the .env file
-mongoose.connect(process.env.MONGODB_URI, { useNewUrlParser: true, useUnifiedTopology: true })
-    .then(() => console.log('Successfully connected to MongoDB'))
-    .catch(err => console.error('MongoDB connection error:', err));
+
 
 // --- Mongoose Schema and Model for Waste data ---
 const WasteSchema = new mongoose.Schema({
@@ -198,7 +294,7 @@ app.get('/api/events', async (req, res) => {
 });
 
 // ROUTE POUR RÉINITIALISER LA BASE DE DONNÉES
-app.get('/api/reset-database', async (req, res) => {
+app.post('/api/reset-database', verifyToken, async (req, res) => {
     try {
         console.log('--- DATABASE RESET TRIGGERED ---');
         await Waste.deleteMany({});
@@ -232,7 +328,7 @@ app.get('/api/reset-database', async (req, res) => {
 // --- Gemini AI API Route ---
 
 // La clé API est maintenant chargée de manière sécurisée depuis le fichier .env
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+let genAI; // Déclaré avec let pour permettre la réinitialisation
 
 app.post('/api/ask-gemini', async (req, res) => {
     try {
@@ -527,6 +623,49 @@ const analyzeAndAlert = async () => {
 setInterval(analyzeAndAlert, 30000);
 
 // --- Start Server ---
-server.listen(PORT, () => {
-    console.log(`Server is running on http://localhost:${PORT}`);
-});
+const startServer = async () => {
+    try {
+        console.log('Connexion à MongoDB...');
+        await mongoose.connect(appConfig.mongoDbUri, { useNewUrlParser: true, useUnifiedTopology: true });
+        console.log('Connecté avec succès à MongoDB.');
+
+        console.log('Vérification et chargement de la configuration...');
+        const config = await Config.getSingleton();
+
+        // Initialisation sécurisée du mot de passe admin au premier démarrage
+        if (!config.adminPasswordHash && process.env.ADMIN_PASSWORD) {
+            console.log('Initialisation du mot de passe administrateur...');
+            const salt = await bcrypt.genSalt(10);
+            config.adminPasswordHash = await bcrypt.hash(process.env.ADMIN_PASSWORD, salt);
+            await config.save();
+            console.log('Mot de passe administrateur initialisé et haché avec succès.');
+        } else if (!config.adminPasswordHash && !process.env.ADMIN_PASSWORD) {
+            console.error('ERREUR: Aucun mot de passe admin n\'est défini dans la DB ou dans le .env. Le login sera impossible.');
+        }
+
+        // Chargement de la clé API Gemini
+        if (config.geminiApiKey) {
+            appConfig.geminiApiKey = config.geminiApiKey;
+            console.log('Clé API Gemini chargée depuis la base de données.');
+        }
+
+        // Initialiser le client Gemini avec la clé API finale
+        if (appConfig.geminiApiKey) {
+            genAI = new GoogleGenerativeAI(appConfig.geminiApiKey);
+            console.log('Client Google Generative AI initialisé.');
+        } else {
+            console.warn('ATTENTION: Aucune clé API Gemini n\'est configurée. L\'assistant IA ne fonctionnera pas.');
+        }
+
+        server.listen(PORT, () => {
+            console.log(`Serveur prêt et à l'écoute sur le port ${PORT}`);
+        });
+
+    } catch (error) {
+        console.error('ERREUR CRITIQUE AU DÉMARRAGE DU SERVEUR :', error);
+        process.exit(1); // Arrête le processus si la connexion DB ou la config échoue
+    }
+};
+
+// Lancer le serveur
+startServer();
