@@ -129,7 +129,9 @@ app.post('/api/admin/config', verifyToken, async (req, res) => {
 // --- Socket.IO Setup ---
 const io = new Server(server, {
     cors: {
-        origin: "http://localhost:3000", // We'll run the React client on port 3000
+        // Idéalement, l'URL de production devrait être une variable d'environnement.
+        // Pour l'urgence, nous autorisons l'URL de Vercel et celle du local.
+        origin: ["http://localhost:3000", "https://convoyeur-front-r5y5.vercel.app"],
         methods: ["GET", "POST"]
     }
 });
